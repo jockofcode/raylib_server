@@ -2,6 +2,9 @@
 #include "protocol.h"
 #include "commands.h"
 #include "handle_registry.h"
+#include "display_list.h"
+#include "upload_registry.h"
+#include "event_registry.h"
 #include "server.h"
 #include "rls_log.h"
 #include "raylib.h"
@@ -15,9 +18,12 @@
 #define DEFAULT_HEIGHT   600
 #define DEFAULT_FPS       60
 
-static CmdQueue       g_queue;
-static ServerState    g_server;
-static HandleRegistry g_registry;
+static CmdQueue             g_queue;
+static ServerState          g_server;
+static HandleRegistry       g_registry;
+static DisplayListRegistry  g_dl_registry;
+static UploadRegistry       g_ur_registry;
+static EventRegistry        g_ev_registry;
 
 static void handle_sigint(int sig) {
     (void)sig;
@@ -47,10 +53,14 @@ int main(int argc, char **argv) {
     // Initialise subsystems.
     cmdq_init(&g_queue);
     handle_registry_init(&g_registry);
-    commands_init(&g_registry);
+    dl_init(&g_dl_registry);
+    ur_init(&g_ur_registry);
+    er_init(&g_ev_registry);
+    commands_init(&g_registry, &g_dl_registry, &g_ur_registry, &g_ev_registry);
 
     // Start the TCP server on a background thread.
-    server_init(&g_server, port, &g_queue);
+    server_init(&g_server, port, &g_queue, &g_dl_registry, &g_ur_registry, &g_ev_registry);
+    commands_set_port(port);
     if (!server_start(&g_server)) {
         RLS_ERROR("failed to bind port %d", port);
         cmdq_destroy(&g_queue);
@@ -80,8 +90,17 @@ int main(int argc, char **argv) {
             protocol_free(e.parsed);
         }
 
+        // Replay all display lists (retained-mode drawing).
+        commands_replay_display_lists();
+
         // Advance any active music streams.
         commands_update_music_streams();
+
+        // Increment the frame counter used by GetServerInfo.
+        commands_tick_frame();
+
+        // Detect input/window events and push to subscribed clients.
+        commands_push_events();
 
         EndDrawing();
     }
@@ -90,6 +109,9 @@ int main(int argc, char **argv) {
     RLS_INFO("shutting down");
     server_stop(&g_server);
     cmdq_destroy(&g_queue);
+    dl_destroy(&g_dl_registry);
+    ur_destroy(&g_ur_registry);
+    er_destroy(&g_ev_registry);
     CloseWindow();
 
     return 0;

@@ -21,6 +21,10 @@ ParsedCmd *protocol_parse_line(const char *line);
 // Free a ParsedCmd and all its fields.
 void protocol_free(ParsedCmd *p);
 
+// Deep-copy a ParsedCmd (id, cmd, args all duplicated).
+// Caller must call protocol_free() on the result.  Returns NULL on OOM.
+ParsedCmd *protocol_clone(const ParsedCmd *src);
+
 // ---------------------------------------------------------------------------
 // Response helpers — return heap-allocated strings; caller must free()
 // ---------------------------------------------------------------------------
@@ -54,7 +58,7 @@ bool proto_parse_rect(const cJSON *val, float *x, float *y, float *w, float *h);
 // Line buffer — accumulates partial TCP reads and emits complete lines
 // ---------------------------------------------------------------------------
 
-#define LINEBUF_MAX (1 << 17)  // 128 KiB per connection
+#define LINEBUF_MAX (1 << 20)  // 1 MiB per connection — supports ~768 KB inline assets after base64 overhead
 
 typedef struct {
     char   data[LINEBUF_MAX];

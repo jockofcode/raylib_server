@@ -1,5 +1,9 @@
 #include "commands.h"
 #include "handle_registry.h"
+#include "display_list.h"
+#include "upload_registry.h"
+#include "event_registry.h"
+#include "server.h"
 #include "b64.h"
 #include "color.h"
 #include "protocol.h"
@@ -32,10 +36,126 @@ typedef struct {
 // Registry
 // ---------------------------------------------------------------------------
 
-static HandleRegistry *g_registry = NULL;
+static HandleRegistry      *g_registry    = NULL;
+static DisplayListRegistry *g_dl_registry = NULL;
+static UploadRegistry      *g_ur_registry = NULL;
+static EventRegistry       *g_ev_registry = NULL;
+static int                  g_server_port = 0;
+static unsigned long        g_frame_count = 0;
 
-void commands_init(HandleRegistry *reg) {
-    g_registry = reg;
+void commands_init(HandleRegistry *reg, DisplayListRegistry *dl_reg,
+                   UploadRegistry *ur_reg, EventRegistry *ev_reg) {
+    g_registry    = reg;
+    g_dl_registry = dl_reg;
+    g_ur_registry = ur_reg;
+    g_ev_registry = ev_reg;
+}
+
+void commands_set_port(int port) {
+    g_server_port = port;
+}
+
+void commands_tick_frame(void) {
+    g_frame_count++;
+}
+
+void commands_push_events(void) {
+    if (!g_ev_registry) return;
+    unsigned long f = g_frame_count;
+    char json[256];
+
+    // KeyPressed — drain raylib's key queue (may be multiple per frame).
+    int key;
+    while ((key = GetKeyPressed()) != 0) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"KeyPressed\",\"key\":%d,\"frame\":%lu}", key, f);
+        er_push(g_ev_registry, EVENT_KEY_PRESSED, json);
+    }
+
+    // KeyReleased — check the range of valid raylib key codes.
+    for (int k = 1; k <= 350; k++) {
+        if (IsKeyReleased(k)) {
+            snprintf(json, sizeof(json),
+                "{\"event\":\"KeyReleased\",\"key\":%d,\"frame\":%lu}", k, f);
+            er_push(g_ev_registry, EVENT_KEY_RELEASED, json);
+        }
+    }
+
+    // MouseMoved — emit when the mouse delta is non-zero.
+    Vector2 delta = GetMouseDelta();
+    if (delta.x != 0.0f || delta.y != 0.0f) {
+        Vector2 pos = GetMousePosition();
+        snprintf(json, sizeof(json),
+            "{\"event\":\"MouseMoved\",\"x\":%.4f,\"y\":%.4f,\"frame\":%lu}",
+            pos.x, pos.y, f);
+        er_push(g_ev_registry, EVENT_MOUSE_MOVED, json);
+    }
+
+    // MouseButtonPressed / MouseButtonReleased (buttons 0–4).
+    for (int b = 0; b <= 4; b++) {
+        if (IsMouseButtonPressed(b)) {
+            Vector2 pos = GetMousePosition();
+            snprintf(json, sizeof(json),
+                "{\"event\":\"MouseButtonPressed\","
+                "\"button\":%d,\"x\":%.4f,\"y\":%.4f,\"frame\":%lu}",
+                b, pos.x, pos.y, f);
+            er_push(g_ev_registry, EVENT_MOUSE_BUTTON_PRESSED, json);
+        }
+        if (IsMouseButtonReleased(b)) {
+            Vector2 pos = GetMousePosition();
+            snprintf(json, sizeof(json),
+                "{\"event\":\"MouseButtonReleased\","
+                "\"button\":%d,\"x\":%.4f,\"y\":%.4f,\"frame\":%lu}",
+                b, pos.x, pos.y, f);
+            er_push(g_ev_registry, EVENT_MOUSE_BUTTON_RELEASED, json);
+        }
+    }
+
+    // MouseWheel.
+    float wheel = GetMouseWheelMove();
+    if (wheel != 0.0f) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"MouseWheel\",\"move\":%.4f,\"frame\":%lu}", wheel, f);
+        er_push(g_ev_registry, EVENT_MOUSE_WHEEL, json);
+    }
+
+    // WindowResized.
+    if (IsWindowResized()) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"WindowResized\",\"width\":%d,\"height\":%d,\"frame\":%lu}",
+            GetScreenWidth(), GetScreenHeight(), f);
+        er_push(g_ev_registry, EVENT_WINDOW_RESIZED, json);
+    }
+
+    // WindowFocused / WindowUnfocused — track state across frames.
+    static bool s_last_focused = true;
+    bool focused = IsWindowFocused();
+    if (focused && !s_last_focused) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"WindowFocused\",\"frame\":%lu}", f);
+        er_push(g_ev_registry, EVENT_WINDOW_FOCUSED, json);
+    } else if (!focused && s_last_focused) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"WindowUnfocused\",\"frame\":%lu}", f);
+        er_push(g_ev_registry, EVENT_WINDOW_UNFOCUSED, json);
+    }
+    s_last_focused = focused;
+
+    // WindowClosed.
+    if (WindowShouldClose()) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"WindowClosed\",\"frame\":%lu}", f);
+        er_push(g_ev_registry, EVENT_WINDOW_CLOSED, json);
+    }
+
+    // GestureDetected.
+    int gesture = GetGestureDetected();
+    if (gesture != 0) {
+        snprintf(json, sizeof(json),
+            "{\"event\":\"GestureDetected\",\"gesture\":%d,\"frame\":%lu}",
+            gesture, f);
+        er_push(g_ev_registry, EVENT_GESTURE_DETECTED, json);
+    }
 }
 
 static void update_music_cb(int id, void *ptr, void *userdata) {
@@ -47,6 +167,16 @@ static void update_music_cb(int id, void *ptr, void *userdata) {
 void commands_update_music_streams(void) {
     if (g_registry)
         handle_iterate(g_registry, HANDLE_MUSIC, update_music_cb, NULL);
+}
+
+static void replay_cmd_cb(const ParsedCmd *cmd, void *userdata) {
+    (void)userdata;
+    commands_execute(cmd, -1);
+}
+
+void commands_replay_display_lists(void) {
+    if (g_dl_registry)
+        dl_replay(g_dl_registry, replay_cmd_cb, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +279,20 @@ static void send_error_response(int conn_fd, const char *id, const char *msg) {
     free(resp);
 }
 
+static void send_ok_result(int conn_fd, const char *id, cJSON *result) {
+    if (id && conn_fd >= 0) {
+        char *resp = protocol_ok(id, result);
+        protocol_send(conn_fd, resp);
+        free(resp);
+    }
+    cJSON_Delete(result);
+}
+
+static void list_handles_cb(int id, void *ptr, void *userdata) {
+    (void)ptr;
+    cJSON_AddItemToArray((cJSON *)userdata, cJSON_CreateNumber(id));
+}
+
 // ---------------------------------------------------------------------------
 // Handle lookup helpers
 // ---------------------------------------------------------------------------
@@ -217,6 +361,50 @@ void commands_execute(const ParsedCmd *cmd, int conn_fd) {
     }
     if (strcmp(name, "SetWindowPosition") == 0) {
         SetWindowPosition(get_int(args, "x", 0), get_int(args, "y", 0));
+        return;
+    }
+    if (strcmp(name, "SetWindowMinSize") == 0) {
+        SetWindowMinSize(get_int(args, "width", 0), get_int(args, "height", 0));
+        return;
+    }
+    if (strcmp(name, "SetWindowMaxSize") == 0) {
+        SetWindowMaxSize(get_int(args, "width", 65535), get_int(args, "height", 65535));
+        return;
+    }
+    if (strcmp(name, "SetWindowState") == 0) {
+        SetWindowState((unsigned int)get_int(args, "flags", 0));
+        return;
+    }
+    if (strcmp(name, "ClearWindowState") == 0) {
+        ClearWindowState((unsigned int)get_int(args, "flags", 0));
+        return;
+    }
+    if (strcmp(name, "SetWindowOpacity") == 0) {
+        SetWindowOpacity(get_float(args, "opacity", 1.0f));
+        return;
+    }
+    if (strcmp(name, "SetWindowFocused") == 0) {
+        SetWindowFocused();
+        return;
+    }
+    if (strcmp(name, "ToggleFullscreen") == 0) {
+        ToggleFullscreen();
+        return;
+    }
+    if (strcmp(name, "ToggleBorderlessWindowed") == 0) {
+        ToggleBorderlessWindowed();
+        return;
+    }
+    if (strcmp(name, "MaximizeWindow") == 0) {
+        MaximizeWindow();
+        return;
+    }
+    if (strcmp(name, "MinimizeWindow") == 0) {
+        MinimizeWindow();
+        return;
+    }
+    if (strcmp(name, "RestoreWindow") == 0) {
+        RestoreWindow();
         return;
     }
     if (strcmp(name, "SetTargetFPS") == 0) {
@@ -1412,6 +1600,425 @@ void commands_execute(const ParsedCmd *cmd, int conn_fd) {
             return;
         }
         send_handle_response(conn_fd, cmd->id, new_h);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked upload — CommitUpload (sync; assembles buffer into resource)
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "CommitUpload") == 0) {
+        if (!g_ur_registry) {
+            send_error_response(conn_fd, cmd->id, "upload registry unavailable"); return;
+        }
+        const char *upload_id = get_string(args, "uploadId", NULL);
+        const char *type      = get_string(args, "type",     NULL);
+        if (!upload_id || !type) {
+            send_error_response(conn_fd, cmd->id, "missing uploadId or type"); return;
+        }
+        UploadCommitInfo info;
+        if (!ur_commit_take(g_ur_registry, upload_id, &info)) {
+            send_error_response(conn_fd, cmd->id,
+                "upload not found or incomplete"); return;
+        }
+
+        if (strcmp(type, "texture") == 0) {
+            Image img = LoadImageFromMemory(info.file_type, info.buf, (int)info.total_bytes);
+            free(info.buf);
+            if (!img.data) { send_error_response(conn_fd, cmd->id, "image decode failed"); return; }
+            Texture2D *tex = malloc(sizeof(Texture2D));
+            if (!tex) { UnloadImage(img); send_error_response(conn_fd, cmd->id, "out of memory"); return; }
+            *tex = LoadTextureFromImage(img);
+            UnloadImage(img);
+            if (tex->id == 0) { free(tex); send_error_response(conn_fd, cmd->id, "texture upload failed"); return; }
+            int h = handle_alloc(g_registry, HANDLE_TEXTURE, tex);
+            if (!h) { UnloadTexture(*tex); free(tex); send_error_response(conn_fd, cmd->id, "handle registry full"); return; }
+            send_handle_response(conn_fd, cmd->id, h);
+            return;
+        }
+        if (strcmp(type, "font") == 0) {
+            int  font_size  = get_int(args, "fontSize", 32);
+            int  cp_count   = 0;
+            int *codepoints = parse_codepoints(
+                cJSON_GetObjectItemCaseSensitive(args, "codepoints"), &cp_count);
+            FontResource *fr = calloc(1, sizeof(FontResource));
+            if (!fr) { free(info.buf); free(codepoints); send_error_response(conn_fd, cmd->id, "out of memory"); return; }
+            fr->font = LoadFontFromMemory(info.file_type, info.buf, (int)info.total_bytes,
+                                          font_size, codepoints, cp_count);
+            free(codepoints);
+            if (fr->font.texture.id == 0) {
+                free(info.buf); free(fr); send_error_response(conn_fd, cmd->id, "font load failed"); return;
+            }
+            fr->data     = info.buf;  /* keep alive for stb_truetype */
+            fr->data_len = info.total_bytes;
+            int h = handle_alloc(g_registry, HANDLE_FONT, fr);
+            if (!h) { UnloadFont(fr->font); free(fr->data); free(fr); send_error_response(conn_fd, cmd->id, "handle registry full"); return; }
+            send_handle_response(conn_fd, cmd->id, h);
+            return;
+        }
+        if (strcmp(type, "sound") == 0) {
+            Wave w = LoadWaveFromMemory(info.file_type, info.buf, (int)info.total_bytes);
+            free(info.buf);
+            if (!w.data) { send_error_response(conn_fd, cmd->id, "wave decode failed"); return; }
+            Sound *snd = malloc(sizeof(Sound));
+            if (!snd) { UnloadWave(w); send_error_response(conn_fd, cmd->id, "out of memory"); return; }
+            *snd = LoadSoundFromWave(w);
+            UnloadWave(w);
+            if (!snd->stream.buffer) { free(snd); send_error_response(conn_fd, cmd->id, "sound load failed"); return; }
+            int h = handle_alloc(g_registry, HANDLE_SOUND, snd);
+            if (!h) { UnloadSound(*snd); free(snd); send_error_response(conn_fd, cmd->id, "handle registry full"); return; }
+            send_handle_response(conn_fd, cmd->id, h);
+            return;
+        }
+        if (strcmp(type, "music") == 0) {
+            MusicResource *mr = calloc(1, sizeof(MusicResource));
+            if (!mr) { free(info.buf); send_error_response(conn_fd, cmd->id, "out of memory"); return; }
+            mr->music = LoadMusicStreamFromMemory(info.file_type, info.buf, (int)info.total_bytes);
+            if (!mr->music.stream.buffer) {
+                free(info.buf); free(mr); send_error_response(conn_fd, cmd->id, "music load failed"); return;
+            }
+            mr->data     = info.buf;  /* keep alive for streaming decoder */
+            mr->data_len = info.total_bytes;
+            int h = handle_alloc(g_registry, HANDLE_MUSIC, mr);
+            if (!h) { UnloadMusicStream(mr->music); free(mr->data); free(mr); send_error_response(conn_fd, cmd->id, "handle registry full"); return; }
+            send_handle_response(conn_fd, cmd->id, h);
+            return;
+        }
+        free(info.buf);
+        send_error_response(conn_fd, cmd->id, "unknown type; use texture, font, sound, or music");
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5: Introspection — Window state queries
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "GetScreenWidth") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "width", GetScreenWidth());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetScreenHeight") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "height", GetScreenHeight());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetRenderWidth") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "width", GetRenderWidth());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetRenderHeight") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "height", GetRenderHeight());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetWindowPosition") == 0) {
+        Vector2 pos = GetWindowPosition();
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", pos.x);
+        cJSON_AddNumberToObject(r, "y", pos.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetWindowScaleDPI") == 0) {
+        Vector2 dpi = GetWindowScaleDPI();
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", dpi.x);
+        cJSON_AddNumberToObject(r, "y", dpi.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowReady") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "ready", cJSON_CreateBool(IsWindowReady()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowFullscreen") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "fullscreen", cJSON_CreateBool(IsWindowFullscreen()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowHidden") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "hidden", cJSON_CreateBool(IsWindowHidden()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowMinimized") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "minimized", cJSON_CreateBool(IsWindowMinimized()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowMaximized") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "maximized", cJSON_CreateBool(IsWindowMaximized()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowFocused") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "focused", cJSON_CreateBool(IsWindowFocused()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsWindowResized") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "resized", cJSON_CreateBool(IsWindowResized()));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetFPS") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "fps", GetFPS());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetFrameTime") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "delta", GetFrameTime());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetTime") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "time", GetTime());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMonitorCount") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "count", GetMonitorCount());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetCurrentMonitor") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "monitor", GetCurrentMonitor());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMonitorWidth") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "width", GetMonitorWidth(get_int(args, "monitor", 0)));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMonitorHeight") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "height", GetMonitorHeight(get_int(args, "monitor", 0)));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMonitorName") == 0) {
+        const char *mname = GetMonitorName(get_int(args, "monitor", 0));
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "name", mname ? mname : "");
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5: Introspection — Input state queries
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "IsKeyPressed") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "pressed", cJSON_CreateBool(IsKeyPressed(get_int(args, "key", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsKeyDown") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "down", cJSON_CreateBool(IsKeyDown(get_int(args, "key", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsKeyReleased") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "released", cJSON_CreateBool(IsKeyReleased(get_int(args, "key", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsKeyUp") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "up", cJSON_CreateBool(IsKeyUp(get_int(args, "key", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetKeyPressed") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "key", GetKeyPressed());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetCharPressed") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "char", GetCharPressed());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsMouseButtonPressed") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "pressed",
+            cJSON_CreateBool(IsMouseButtonPressed(get_int(args, "button", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsMouseButtonDown") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "down",
+            cJSON_CreateBool(IsMouseButtonDown(get_int(args, "button", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsMouseButtonReleased") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "released",
+            cJSON_CreateBool(IsMouseButtonReleased(get_int(args, "button", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMousePosition") == 0) {
+        Vector2 pos = GetMousePosition();
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", pos.x);
+        cJSON_AddNumberToObject(r, "y", pos.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMouseDelta") == 0) {
+        Vector2 d = GetMouseDelta();
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", d.x);
+        cJSON_AddNumberToObject(r, "y", d.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMouseWheelMove") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "move", GetMouseWheelMove());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetMouseWheelMoveV") == 0) {
+        Vector2 mv = GetMouseWheelMoveV();
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", mv.x);
+        cJSON_AddNumberToObject(r, "y", mv.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsGamepadAvailable") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "available",
+            cJSON_CreateBool(IsGamepadAvailable(get_int(args, "gamepad", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsGamepadButtonPressed") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "pressed",
+            cJSON_CreateBool(IsGamepadButtonPressed(
+                get_int(args, "gamepad", 0), get_int(args, "button", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "IsGamepadButtonDown") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddItemToObject(r, "down",
+            cJSON_CreateBool(IsGamepadButtonDown(
+                get_int(args, "gamepad", 0), get_int(args, "button", 0))));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetGamepadAxisMovement") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "movement",
+            GetGamepadAxisMovement(get_int(args, "gamepad", 0), get_int(args, "axis", 0)));
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetTouchPointCount") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "count", GetTouchPointCount());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetTouchPosition") == 0) {
+        Vector2 tp = GetTouchPosition(get_int(args, "index", 0));
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "x", tp.x);
+        cJSON_AddNumberToObject(r, "y", tp.y);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetGestureDetected") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "gesture", GetGestureDetected());
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5: Introspection — Resource and server queries
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "ListHandles") == 0) {
+        if (!g_registry) { send_error_response(conn_fd, cmd->id, "registry unavailable"); return; }
+        cJSON *result = cJSON_CreateObject();
+        struct { HandleKind kind; const char *key; } kinds[] = {
+            { HANDLE_TEXTURE,        "textures" },
+            { HANDLE_FONT,           "fonts" },
+            { HANDLE_RENDER_TEXTURE, "renderTextures" },
+            { HANDLE_SOUND,          "sounds" },
+            { HANDLE_MUSIC,          "music" },
+            { HANDLE_SHADER,         "shaders" },
+        };
+        for (int i = 0; i < 6; i++) {
+            cJSON *arr = cJSON_CreateArray();
+            handle_iterate(g_registry, kinds[i].kind, list_handles_cb, arr);
+            cJSON_AddItemToObject(result, kinds[i].key, arr);
+        }
+        send_ok_result(conn_fd, cmd->id, result);
+        return;
+    }
+    if (strcmp(name, "GetTextureInfo") == 0) {
+        Texture2D *tex = get_tex_any(get_int(args, "handle", 0));
+        if (!tex) { send_error_response(conn_fd, cmd->id, "invalid handle"); return; }
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "width",   tex->width);
+        cJSON_AddNumberToObject(r, "height",  tex->height);
+        cJSON_AddNumberToObject(r, "mipmaps", tex->mipmaps);
+        cJSON_AddNumberToObject(r, "format",  tex->format);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetFontInfo") == 0) {
+        FontResource *fr = g_registry
+            ? handle_get(g_registry, get_int(args, "handle", 0), HANDLE_FONT) : NULL;
+        if (!fr) { send_error_response(conn_fd, cmd->id, "invalid handle"); return; }
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddNumberToObject(r, "baseSize",   fr->font.baseSize);
+        cJSON_AddNumberToObject(r, "glyphCount", fr->font.glyphCount);
+        send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+    if (strcmp(name, "GetServerInfo") == 0) {
+        cJSON *r = cJSON_CreateObject();
+        cJSON_AddStringToObject(r, "version", "1.0.0");
+        cJSON_AddNumberToObject(r, "port",    g_server_port);
+        cJSON_AddNumberToObject(r, "fps",     GetFPS());
+        cJSON_AddNumberToObject(r, "frame",   (double)g_frame_count);
+        cJSON_AddNumberToObject(r, "clients", server_get_active_clients());
+        send_ok_result(conn_fd, cmd->id, r);
         return;
     }
 

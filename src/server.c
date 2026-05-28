@@ -1,6 +1,9 @@
 #include "server.h"
 #include "protocol.h"
 #include "queue.h"
+#include "display_list.h"
+#include "upload_registry.h"
+#include "event_registry.h"
 #include "rls_log.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -18,13 +21,17 @@
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    int        fd;
-    int        id;
-    CmdQueue  *queue;
-    LineBuffer linebuf;
+    int                  fd;
+    int                  id;
+    CmdQueue            *queue;
+    DisplayListRegistry *dl_registry;
+    UploadRegistry      *ur_registry;
+    EventRegistry       *ev_registry;
+    LineBuffer           linebuf;
 } ConnState;
 
-static _Atomic int g_next_client_id = 1;
+static _Atomic int g_next_client_id  = 1;
+static _Atomic int g_active_clients  = 0;
 
 // ---------------------------------------------------------------------------
 // Line callback — called by linebuf_feed for each complete line
@@ -43,6 +50,28 @@ static void on_line(const char *line, void *userdata) {
     }
 
     RLS_DEBUG("client %d: queued cmd=%s", conn->id, p->cmd);
+
+    // Display-list commands are handled directly in the connection thread.
+    if (conn->dl_registry && dl_handle_cmd(conn->dl_registry, p, conn->fd)) {
+        protocol_free(p);
+        return;
+    }
+
+    // Chunked upload commands (BeginUpload, UploadChunk, AbortUpload,
+    // ListUploads) are handled directly in the connection thread.
+    // CommitUpload is NOT intercepted here — it goes through the queue so
+    // the main thread can call raylib resource-loading APIs.
+    if (conn->ur_registry && ur_handle_cmd(conn->ur_registry, p, conn->fd)) {
+        protocol_free(p);
+        return;
+    }
+
+    // Event subscription commands (Subscribe, Unsubscribe) are handled
+    // directly in the connection thread.
+    if (conn->ev_registry && er_handle_cmd(conn->ev_registry, p, conn->fd)) {
+        protocol_free(p);
+        return;
+    }
 
     // Sync commands (Load*, Upload*, Get*, Measure*, etc.) need the main
     // thread to execute them before a result is known.  Skip the optimistic
@@ -76,6 +105,7 @@ static void *connection_thread(void *arg) {
     int id = conn->id;
     char buf[4096];
 
+    atomic_fetch_add(&g_active_clients, 1);
     RLS_INFO("client %d connected (fd=%d)", id, conn->fd);
 
     while (1) {
@@ -91,6 +121,9 @@ static void *connection_thread(void *arg) {
         }
     }
 
+    atomic_fetch_sub(&g_active_clients, 1);
+    if (conn->ev_registry)
+        er_remove_fd(conn->ev_registry, conn->fd);
     RLS_INFO("client %d disconnected", id);
     close(conn->fd);
     free(conn);
@@ -120,9 +153,12 @@ static void *listener_thread(void *arg) {
         ConnState *conn = calloc(1, sizeof(ConnState));
         if (!conn) { close(client_fd); continue; }
 
-        conn->fd    = client_fd;
-        conn->id    = atomic_fetch_add(&g_next_client_id, 1);
-        conn->queue = s->queue;
+        conn->fd          = client_fd;
+        conn->id          = atomic_fetch_add(&g_next_client_id, 1);
+        conn->queue       = s->queue;
+        conn->dl_registry = s->dl_registry;
+        conn->ur_registry = s->ur_registry;
+        conn->ev_registry = s->ev_registry;
         linebuf_init(&conn->linebuf);
 
         pthread_t t;
@@ -143,11 +179,17 @@ static void *listener_thread(void *arg) {
 // Public API
 // ---------------------------------------------------------------------------
 
-void server_init(ServerState *s, int port, CmdQueue *queue) {
+void server_init(ServerState *s, int port, CmdQueue *queue,
+                 DisplayListRegistry *dl_registry,
+                 UploadRegistry      *ur_registry,
+                 EventRegistry       *ev_registry) {
     memset(s, 0, sizeof(*s));
-    s->port      = port;
-    s->queue     = queue;
-    s->listen_fd = -1;
+    s->port        = port;
+    s->queue       = queue;
+    s->dl_registry = dl_registry;
+    s->ur_registry = ur_registry;
+    s->ev_registry = ev_registry;
+    s->listen_fd   = -1;
 }
 
 bool server_start(ServerState *s) {
@@ -184,6 +226,10 @@ bool server_start(ServerState *s) {
     }
 
     return true;
+}
+
+int server_get_active_clients(void) {
+    return (int)atomic_load(&g_active_clients);
 }
 
 void server_stop(ServerState *s) {

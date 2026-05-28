@@ -44,6 +44,22 @@ void protocol_free(ParsedCmd *p) {
     free(p);
 }
 
+ParsedCmd *protocol_clone(const ParsedCmd *src) {
+    if (!src) return NULL;
+    ParsedCmd *dst = calloc(1, sizeof(ParsedCmd));
+    if (!dst) return NULL;
+    if (src->id) {
+        dst->id = strdup(src->id);
+        if (!dst->id) { free(dst); return NULL; }
+    }
+    if (src->cmd) {
+        dst->cmd = strdup(src->cmd);
+        if (!dst->cmd) { free(dst->id); free(dst); return NULL; }
+    }
+    if (src->args) dst->args = cJSON_Duplicate(src->args, 1);
+    return dst;
+}
+
 // ---------------------------------------------------------------------------
 // Response builders
 // ---------------------------------------------------------------------------
