@@ -1247,7 +1247,7 @@ int main(void) {
     dl_init(&g_dl_registry);
     ur_init(&g_ur_registry);
     er_init(&g_ev_registry);
-    server_init(&g_server, TEST_PORT, &g_queue, &g_dl_registry, &g_ur_registry, &g_ev_registry);
+    server_init(&g_server, TEST_PORT, &g_queue, &g_dl_registry, &g_ur_registry, &g_ev_registry, NULL);
     if (!server_start(&g_server)) {
         fprintf(stderr, "FATAL: could not start test server on port %d\n", TEST_PORT);
         return 1;

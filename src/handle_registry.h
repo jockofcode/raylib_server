@@ -12,6 +12,7 @@ typedef enum {
     HANDLE_SOUND,
     HANDLE_MUSIC,
     HANDLE_SHADER,
+    HANDLE_MODEL,
 } HandleKind;
 
 typedef struct {

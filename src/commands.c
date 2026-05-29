@@ -3,6 +3,7 @@
 #include "display_list.h"
 #include "upload_registry.h"
 #include "event_registry.h"
+#include "timer_registry.h"
 #include "server.h"
 #include "b64.h"
 #include "color.h"
@@ -40,15 +41,18 @@ static HandleRegistry      *g_registry    = NULL;
 static DisplayListRegistry *g_dl_registry = NULL;
 static UploadRegistry      *g_ur_registry = NULL;
 static EventRegistry       *g_ev_registry = NULL;
+static TimerRegistry       *g_tr_registry = NULL;
 static int                  g_server_port = 0;
 static unsigned long        g_frame_count = 0;
 
 void commands_init(HandleRegistry *reg, DisplayListRegistry *dl_reg,
-                   UploadRegistry *ur_reg, EventRegistry *ev_reg) {
+                   UploadRegistry *ur_reg, EventRegistry *ev_reg,
+                   TimerRegistry *tr_reg) {
     g_registry    = reg;
     g_dl_registry = dl_reg;
     g_ur_registry = ur_reg;
     g_ev_registry = ev_reg;
+    g_tr_registry = tr_reg;
 }
 
 void commands_set_port(int port) {
@@ -158,6 +162,26 @@ void commands_push_events(void) {
     }
 }
 
+typedef struct {
+    EventRegistry  *ev;
+    unsigned long   frame;
+} TimerFiredCtx;
+
+static void timer_fired_cb(const char *id, const char *name, void *userdata) {
+    TimerFiredCtx *ctx = userdata;
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"event\":\"TimerFired\",\"timerId\":\"%s\",\"name\":\"%s\",\"frame\":%lu}",
+        id, name, ctx->frame);
+    er_push(ctx->ev, EVENT_TIMER_FIRED, json);
+}
+
+void commands_tick_timers(void) {
+    if (!g_tr_registry || !g_ev_registry) return;
+    TimerFiredCtx ctx = { g_ev_registry, g_frame_count };
+    timer_tick(g_tr_registry, (double)GetFrameTime(), timer_fired_cb, &ctx);
+}
+
 static void update_music_cb(int id, void *ptr, void *userdata) {
     (void)id; (void)userdata;
     // MusicResource has Music as first member; plain Music* also works.
@@ -236,6 +260,31 @@ static Camera2D get_camera2d(cJSON *obj, const char *key) {
     cam.target   = get_vec2(c, "target",   (Vector2){0, 0});
     cam.rotation = get_float(c, "rotation", 0.0f);
     cam.zoom     = get_float(c, "zoom",     1.0f);
+    return cam;
+}
+
+static Vector3 get_vec3(cJSON *obj, const char *key, Vector3 fallback) {
+    float x, y, z;
+    if (proto_parse_vec3(cJSON_GetObjectItemCaseSensitive(obj, key), &x, &y, &z))
+        return (Vector3){x, y, z};
+    return fallback;
+}
+
+static Camera3D get_camera3d(cJSON *obj, const char *key) {
+    Camera3D cam = {
+        .position   = { 0.0f, 10.0f, 10.0f },
+        .target     = { 0.0f, 0.0f, 0.0f },
+        .up         = { 0.0f, 1.0f, 0.0f },
+        .fovy       = 45.0f,
+        .projection = CAMERA_PERSPECTIVE,
+    };
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!c) return cam;
+    cam.position   = get_vec3(c, "position",   cam.position);
+    cam.target     = get_vec3(c, "target",     cam.target);
+    cam.up         = get_vec3(c, "up",         cam.up);
+    cam.fovy       = get_float(c, "fovy",       cam.fovy);
+    cam.projection = get_int(c,  "projection",  CAMERA_PERSPECTIVE);
     return cam;
 }
 
@@ -476,6 +525,14 @@ void commands_execute(const ParsedCmd *cmd, int conn_fd) {
     }
     if (strcmp(name, "EndShaderMode") == 0) {
         EndShaderMode();
+        return;
+    }
+    if (strcmp(name, "BeginMode3D") == 0) {
+        BeginMode3D(get_camera3d(args, "camera"));
+        return;
+    }
+    if (strcmp(name, "EndMode3D") == 0) {
+        EndMode3D();
         return;
     }
 
@@ -1981,8 +2038,9 @@ void commands_execute(const ParsedCmd *cmd, int conn_fd) {
             { HANDLE_SOUND,          "sounds" },
             { HANDLE_MUSIC,          "music" },
             { HANDLE_SHADER,         "shaders" },
+            { HANDLE_MODEL,          "models" },
         };
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             cJSON *arr = cJSON_CreateArray();
             handle_iterate(g_registry, kinds[i].kind, list_handles_cb, arr);
             cJSON_AddItemToObject(result, kinds[i].key, arr);
@@ -2019,6 +2077,241 @@ void commands_execute(const ParsedCmd *cmd, int conn_fd) {
         cJSON_AddNumberToObject(r, "frame",   (double)g_frame_count);
         cJSON_AddNumberToObject(r, "clients", server_get_active_clients());
         send_ok_result(conn_fd, cmd->id, r);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8: 3D Drawing
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "DrawLine3D") == 0) {
+        DrawLine3D(get_vec3(args, "startPos", (Vector3){0,0,0}),
+                   get_vec3(args, "endPos",   (Vector3){1,1,1}),
+                   COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawPoint3D") == 0) {
+        DrawPoint3D(get_vec3(args, "position", (Vector3){0,0,0}),
+                    COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCircle3D") == 0) {
+        DrawCircle3D(get_vec3(args, "center", (Vector3){0,0,0}),
+                     get_float(args, "radius", 1.0f),
+                     get_vec3(args, "rotationAxis", (Vector3){0,1,0}),
+                     get_float(args, "rotationAngle", 0.0f),
+                     COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawTriangle3D") == 0) {
+        DrawTriangle3D(get_vec3(args, "v1", (Vector3){0,0,0}),
+                       get_vec3(args, "v2", (Vector3){1,0,0}),
+                       get_vec3(args, "v3", (Vector3){0,1,0}),
+                       COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCube") == 0) {
+        DrawCube(get_vec3(args, "position", (Vector3){0,0,0}),
+                 get_float(args, "width", 1.0f),
+                 get_float(args, "height", 1.0f),
+                 get_float(args, "length", 1.0f),
+                 COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCubeV") == 0) {
+        DrawCubeV(get_vec3(args, "position", (Vector3){0,0,0}),
+                  get_vec3(args, "size",     (Vector3){1,1,1}),
+                  COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCubeWires") == 0) {
+        DrawCubeWires(get_vec3(args, "position", (Vector3){0,0,0}),
+                      get_float(args, "width", 1.0f),
+                      get_float(args, "height", 1.0f),
+                      get_float(args, "length", 1.0f),
+                      COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCubeWiresV") == 0) {
+        DrawCubeWiresV(get_vec3(args, "position", (Vector3){0,0,0}),
+                       get_vec3(args, "size",     (Vector3){1,1,1}),
+                       COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawSphere") == 0) {
+        DrawSphere(get_vec3(args, "centerPos", (Vector3){0,0,0}),
+                   get_float(args, "radius", 1.0f),
+                   COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawSphereEx") == 0) {
+        DrawSphereEx(get_vec3(args, "centerPos", (Vector3){0,0,0}),
+                     get_float(args, "radius", 1.0f),
+                     get_int(args, "rings", 8),
+                     get_int(args, "slices", 8),
+                     COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawSphereWires") == 0) {
+        DrawSphereWires(get_vec3(args, "centerPos", (Vector3){0,0,0}),
+                        get_float(args, "radius", 1.0f),
+                        get_int(args, "rings", 8),
+                        get_int(args, "slices", 8),
+                        COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCylinder") == 0) {
+        DrawCylinder(get_vec3(args, "position", (Vector3){0,0,0}),
+                     get_float(args, "radiusTop",    1.0f),
+                     get_float(args, "radiusBottom", 1.0f),
+                     get_float(args, "height", 2.0f),
+                     get_int(args, "slices", 8),
+                     COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCylinderEx") == 0) {
+        DrawCylinderEx(get_vec3(args, "startPos", (Vector3){0,0,0}),
+                       get_vec3(args, "endPos",   (Vector3){0,2,0}),
+                       get_float(args, "startRadius", 1.0f),
+                       get_float(args, "endRadius",   1.0f),
+                       get_int(args, "sides", 8),
+                       COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCylinderWires") == 0) {
+        DrawCylinderWires(get_vec3(args, "position", (Vector3){0,0,0}),
+                          get_float(args, "radiusTop",    1.0f),
+                          get_float(args, "radiusBottom", 1.0f),
+                          get_float(args, "height", 2.0f),
+                          get_int(args, "slices", 8),
+                          COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCylinderWiresEx") == 0) {
+        DrawCylinderWiresEx(get_vec3(args, "startPos", (Vector3){0,0,0}),
+                            get_vec3(args, "endPos",   (Vector3){0,2,0}),
+                            get_float(args, "startRadius", 1.0f),
+                            get_float(args, "endRadius",   1.0f),
+                            get_int(args, "sides", 8),
+                            COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCapsule") == 0) {
+        DrawCapsule(get_vec3(args, "startPos", (Vector3){0,0,0}),
+                    get_vec3(args, "endPos",   (Vector3){0,2,0}),
+                    get_float(args, "radius", 0.5f),
+                    get_int(args, "slices", 8),
+                    get_int(args, "rings",  4),
+                    COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawCapsuleWires") == 0) {
+        DrawCapsuleWires(get_vec3(args, "startPos", (Vector3){0,0,0}),
+                         get_vec3(args, "endPos",   (Vector3){0,2,0}),
+                         get_float(args, "radius", 0.5f),
+                         get_int(args, "slices", 8),
+                         get_int(args, "rings",  4),
+                         COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawPlane") == 0) {
+        DrawPlane(get_vec3(args, "centerPos", (Vector3){0,0,0}),
+                  get_vec2(args, "size", (Vector2){10,10}),
+                  COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawRay") == 0) {
+        Ray ray = {
+            .position  = get_vec3(args, "position",  (Vector3){0,0,0}),
+            .direction = get_vec3(args, "direction", (Vector3){0,1,0}),
+        };
+        DrawRay(ray, COL("color", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawGrid") == 0) {
+        DrawGrid(get_int(args, "slices", 10), get_float(args, "spacing", 1.0f));
+        return;
+    }
+    if (strcmp(name, "DrawBoundingBox") == 0) {
+        BoundingBox box = {
+            .min = get_vec3(args, "min", (Vector3){-0.5f,-0.5f,-0.5f}),
+            .max = get_vec3(args, "max", (Vector3){ 0.5f, 0.5f, 0.5f}),
+        };
+        DrawBoundingBox(box, COL("color", GREEN));
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8: Model loading and drawing
+    // -----------------------------------------------------------------------
+
+    if (strcmp(name, "LoadModel") == 0) {
+        const char *path = get_string(args, "path", "");
+        Model *m = malloc(sizeof(Model));
+        if (!m) { send_error_response(conn_fd, cmd->id, "OOM"); return; }
+        *m = LoadModel(path);
+        if (m->meshCount == 0) {
+            free(m);
+            send_error_response(conn_fd, cmd->id, "LoadModel failed");
+            return;
+        }
+        int h = handle_alloc(g_registry, HANDLE_MODEL, m);
+        if (!h) { UnloadModel(*m); free(m); send_error_response(conn_fd, cmd->id, "registry full"); return; }
+        send_handle_response(conn_fd, cmd->id, h);
+        return;
+    }
+    if (strcmp(name, "UnloadModel") == 0) {
+        if (!g_registry) return;
+        int h = get_int(args, "handle", 0);
+        Model *m = handle_get(g_registry, h, HANDLE_MODEL);
+        if (!m) { RLS_WARNING("UnloadModel: invalid handle %d", h); return; }
+        UnloadModel(*m);
+        free(m);
+        handle_free(g_registry, h);
+        return;
+    }
+    if (strcmp(name, "DrawModel") == 0) {
+        int h = get_int(args, "handle", 0);
+        Model *m = g_registry ? handle_get(g_registry, h, HANDLE_MODEL) : NULL;
+        if (!m) { RLS_WARNING("DrawModel: invalid handle %d", h); return; }
+        DrawModel(*m,
+                  get_vec3(args, "position", (Vector3){0,0,0}),
+                  get_float(args, "scale", 1.0f),
+                  COL("tint", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawModelEx") == 0) {
+        int h = get_int(args, "handle", 0);
+        Model *m = g_registry ? handle_get(g_registry, h, HANDLE_MODEL) : NULL;
+        if (!m) { RLS_WARNING("DrawModelEx: invalid handle %d", h); return; }
+        DrawModelEx(*m,
+                    get_vec3(args, "position",     (Vector3){0,0,0}),
+                    get_vec3(args, "rotationAxis",  (Vector3){0,1,0}),
+                    get_float(args, "rotationAngle", 0.0f),
+                    get_vec3(args, "scale",          (Vector3){1,1,1}),
+                    COL("tint", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawModelWires") == 0) {
+        int h = get_int(args, "handle", 0);
+        Model *m = g_registry ? handle_get(g_registry, h, HANDLE_MODEL) : NULL;
+        if (!m) { RLS_WARNING("DrawModelWires: invalid handle %d", h); return; }
+        DrawModelWires(*m,
+                       get_vec3(args, "position", (Vector3){0,0,0}),
+                       get_float(args, "scale", 1.0f),
+                       COL("tint", WHITE));
+        return;
+    }
+    if (strcmp(name, "DrawModelWiresEx") == 0) {
+        int h = get_int(args, "handle", 0);
+        Model *m = g_registry ? handle_get(g_registry, h, HANDLE_MODEL) : NULL;
+        if (!m) { RLS_WARNING("DrawModelWiresEx: invalid handle %d", h); return; }
+        DrawModelWiresEx(*m,
+                         get_vec3(args, "position",      (Vector3){0,0,0}),
+                         get_vec3(args, "rotationAxis",  (Vector3){0,1,0}),
+                         get_float(args, "rotationAngle", 0.0f),
+                         get_vec3(args, "scale",          (Vector3){1,1,1}),
+                         COL("tint", WHITE));
         return;
     }
 

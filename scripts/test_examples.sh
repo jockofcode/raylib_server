@@ -51,6 +51,24 @@ kill_tree() {
     kill -KILL "$pid" 2>/dev/null || true
 }
 
+# Reset server state between examples: delete any lingering display lists
+# and clear the background to black so the next example starts clean.
+reset_server_state() {
+    ruby -rsocket -rjson -e '
+      s = TCPSocket.new("localhost", 7878) rescue exit
+      # Remove any display lists the previous example left behind.
+      s.puts JSON.generate({id:"rst",cmd:"GetDisplayLists"})
+      resp = JSON.parse(s.gets) rescue {}
+      (resp.dig("result","lists") || []).each do |name|
+        s.puts JSON.generate({cmd:"DisplayListDelete",args:{name:name}})
+      end
+      # Clear the screen.
+      s.puts JSON.generate({cmd:"ClearBackground",args:{color:[0,0,0,255]}})
+      sleep 0.15
+      s.close rescue nil
+    ' 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -117,6 +135,9 @@ run_example() {
     # Allow time for server to detect EOF and flush the disconnect log entry.
     sleep 1
 
+    # Clear screen and display lists so the next example starts clean.
+    reset_server_state
+
     # Extract only the log lines written during this run.
     local new_logs
     new_logs=$(tail -c "+$((before + 1))" "$LOG_FILE")
@@ -167,6 +188,16 @@ run_example "shapes_demo.rb"         "ruby '$EXAMPLES_DIR/shapes_demo.rb'"      
 run_example "camera_zoom.rb"         "ruby '$EXAMPLES_DIR/camera_zoom.rb'"             4  "$CONNECT_PAT" "$DISCONNECT_PAT"
 run_example "splines_demo.rb"        "ruby '$EXAMPLES_DIR/splines_demo.rb'"            4  "$CONNECT_PAT" "$DISCONNECT_PAT"
 run_example "render_texture_demo.rb" "ruby '$EXAMPLES_DIR/render_texture_demo.rb'"     6  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "display_list_demo.rb"   "ruby '$EXAMPLES_DIR/display_list_demo.rb'"       6  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "sprite_demo.rb"              "ruby '$EXAMPLES_DIR/sprite_demo.rb'"              6  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "window_management_demo.rb"   "ruby '$EXAMPLES_DIR/window_management_demo.rb'"   8  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "event_streaming_demo.rb"    "ruby '$EXAMPLES_DIR/event_streaming_demo.rb'"      5  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "audio_demo.rb"              "ruby '$EXAMPLES_DIR/audio_demo.rb'"                10  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "input_demo.rb"              "ruby '$EXAMPLES_DIR/input_demo.rb'"                 5  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "library_demo.rb"            "ruby '$EXAMPLES_DIR/library_demo.rb'"               5  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "3d_demo.rb"                "ruby '$EXAMPLES_DIR/3d_demo.rb'"                    5  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "timer_demo.rb"             "ruby '$EXAMPLES_DIR/timer_demo.rb'"                 8  "$CONNECT_PAT" "$DISCONNECT_PAT"
+run_example "msgpack_bench.rb"          "ruby '$EXAMPLES_DIR/msgpack_bench.rb' 7878 2"          10 "$CONNECT_PAT" "$DISCONNECT_PAT" "binary.*mode"
 
 # ---------------------------------------------------------------------------
 # Summary

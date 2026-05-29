@@ -5,6 +5,7 @@
 #include "display_list.h"
 #include "upload_registry.h"
 #include "event_registry.h"
+#include "timer_registry.h"
 #include "server.h"
 #include "rls_log.h"
 #include "raylib.h"
@@ -24,6 +25,7 @@ static HandleRegistry       g_registry;
 static DisplayListRegistry  g_dl_registry;
 static UploadRegistry       g_ur_registry;
 static EventRegistry        g_ev_registry;
+static TimerRegistry        g_tr_registry;
 
 static void handle_sigint(int sig) {
     (void)sig;
@@ -56,10 +58,11 @@ int main(int argc, char **argv) {
     dl_init(&g_dl_registry);
     ur_init(&g_ur_registry);
     er_init(&g_ev_registry);
-    commands_init(&g_registry, &g_dl_registry, &g_ur_registry, &g_ev_registry);
+    timer_registry_init(&g_tr_registry);
+    commands_init(&g_registry, &g_dl_registry, &g_ur_registry, &g_ev_registry, &g_tr_registry);
 
     // Start the TCP server on a background thread.
-    server_init(&g_server, port, &g_queue, &g_dl_registry, &g_ur_registry, &g_ev_registry);
+    server_init(&g_server, port, &g_queue, &g_dl_registry, &g_ur_registry, &g_ev_registry, &g_tr_registry);
     commands_set_port(port);
     if (!server_start(&g_server)) {
         RLS_ERROR("failed to bind port %d", port);
@@ -99,6 +102,9 @@ int main(int argc, char **argv) {
         // Increment the frame counter used by GetServerInfo.
         commands_tick_frame();
 
+        // Advance animation timers and fire TimerFired events.
+        commands_tick_timers();
+
         // Detect input/window events and push to subscribed clients.
         commands_push_events();
 
@@ -112,6 +118,7 @@ int main(int argc, char **argv) {
     dl_destroy(&g_dl_registry);
     ur_destroy(&g_ur_registry);
     er_destroy(&g_ev_registry);
+    timer_registry_destroy(&g_tr_registry);
     CloseWindow();
 
     return 0;

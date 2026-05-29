@@ -4,11 +4,13 @@
 #include "display_list.h"
 #include "upload_registry.h"
 #include "event_registry.h"
+#include "timer_registry.h"
 
-// Initialise the command module with the resource, display-list, upload, and event registries.
+// Initialise the command module with registries.
 // Must be called before the first commands_execute call.
 void commands_init(HandleRegistry *reg, DisplayListRegistry *dl_reg,
-                   UploadRegistry *ur_reg, EventRegistry *ev_reg);
+                   UploadRegistry *ur_reg, EventRegistry *ev_reg,
+                   TimerRegistry *tr_reg);
 
 // Execute a single parsed command using raylib.
 // Must be called from the main thread (raylib/OpenGL requirement).
@@ -34,3 +36,7 @@ void commands_tick_frame(void);
 // Detect input and window events this frame and push them to subscribed clients.
 // Call once per frame from the render loop, after commands_tick_frame.
 void commands_push_events(void);
+
+// Advance all timers by GetFrameTime() and fire TimerFired events.
+// Call once per frame from the render loop.
+void commands_tick_timers(void);

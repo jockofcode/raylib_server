@@ -67,6 +67,11 @@ set(CORE_SOURCES
   src/server.c
   src/rls_log.c
   src/b64.c
+  src/display_list.c
+  src/upload_registry.c
+  src/event_registry.c
+  src/timer_registry.c
+  src/msgpack.c
 )
 
 add_library(rls_core STATIC ${CORE_SOURCES})
@@ -101,6 +106,11 @@ add_unit_test(test_queue           test_queue.c)
 add_unit_test(test_protocol        test_protocol.c)
 add_unit_test(test_handle_registry test_handle_registry.c)
 add_unit_test(test_b64             test_b64.c)
+add_unit_test(test_display_list    test_display_list.c)
+add_unit_test(test_upload_registry test_upload_registry.c)
+add_unit_test(test_event_registry  test_event_registry.c)
+add_unit_test(test_timer_registry  test_timer_registry.c)
+add_unit_test(test_msgpack         test_msgpack.c)
 
 add_executable(test_integration
   tests/test_integration.c

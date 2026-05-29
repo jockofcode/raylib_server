@@ -19,6 +19,7 @@ static const char *g_event_names[EVENT_KIND_COUNT] = {
     "WindowUnfocused",
     "WindowClosed",
     "GestureDetected",
+    "TimerFired",
 };
 
 int er_kind_from_name(const char *name) {

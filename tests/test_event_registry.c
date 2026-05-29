@@ -27,6 +27,7 @@ void test_kind_from_name_all_known(void) {
     TEST_ASSERT_EQUAL_INT(EVENT_WINDOW_UNFOCUSED,      er_kind_from_name("WindowUnfocused"));
     TEST_ASSERT_EQUAL_INT(EVENT_WINDOW_CLOSED,         er_kind_from_name("WindowClosed"));
     TEST_ASSERT_EQUAL_INT(EVENT_GESTURE_DETECTED,      er_kind_from_name("GestureDetected"));
+    TEST_ASSERT_EQUAL_INT(EVENT_TIMER_FIRED,           er_kind_from_name("TimerFired"));
 }
 
 void test_kind_from_name_unknown(void) {

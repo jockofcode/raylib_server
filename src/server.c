@@ -1,9 +1,11 @@
 #include "server.h"
 #include "protocol.h"
+#include "msgpack.h"
 #include "queue.h"
 #include "display_list.h"
 #include "upload_registry.h"
 #include "event_registry.h"
+#include "timer_registry.h"
 #include "rls_log.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -27,7 +29,9 @@ typedef struct {
     DisplayListRegistry *dl_registry;
     UploadRegistry      *ur_registry;
     EventRegistry       *ev_registry;
+    TimerRegistry       *tr_registry;
     LineBuffer           linebuf;
+    bool                 binary_mode;  // true after client sends "BINARY"
 } ConnState;
 
 static _Atomic int g_next_client_id  = 1;
@@ -37,19 +41,9 @@ static _Atomic int g_active_clients  = 0;
 // Line callback — called by linebuf_feed for each complete line
 // ---------------------------------------------------------------------------
 
-static void on_line(const char *line, void *userdata) {
-    ConnState *conn = userdata;
-
-    ParsedCmd *p = protocol_parse_line(line);
-    if (!p) {
-        RLS_WARNING("client %d: parse error — %.200s", conn->id, line);
-        char *err = protocol_error(NULL, "parse error: invalid JSON or missing cmd");
-        protocol_send(conn->fd, err);
-        free(err);
-        return;
-    }
-
-    RLS_DEBUG("client %d: queued cmd=%s", conn->id, p->cmd);
+// Shared ParsedCmd dispatch — called from both on_line and on_binary_message.
+static void dispatch_cmd(ConnState *conn, ParsedCmd *p) {
+    RLS_DEBUG("client %d: cmd=%s", conn->id, p->cmd);
 
     // Display-list commands are handled directly in the connection thread.
     if (conn->dl_registry && dl_handle_cmd(conn->dl_registry, p, conn->fd)) {
@@ -73,6 +67,13 @@ static void on_line(const char *line, void *userdata) {
         return;
     }
 
+    // Timer commands (TimerCreate, TimerOnce, TimerDelete, ListTimers) are
+    // handled directly in the connection thread.
+    if (conn->tr_registry && tr_handle_cmd(conn->tr_registry, p, conn->fd)) {
+        protocol_free(p);
+        return;
+    }
+
     // Sync commands (Load*, Upload*, Get*, Measure*, etc.) need the main
     // thread to execute them before a result is known.  Skip the optimistic
     // ACK; commands_execute() will send the real response.
@@ -90,10 +91,87 @@ static void on_line(const char *line, void *userdata) {
     };
 
     if (!cmdq_push(conn->queue, e)) {
-        // Queue has been shut down; discard.
         protocol_free(p);
     }
-    // p is now owned by the queue entry — do not free here on success.
+}
+
+static void on_line(const char *line, void *userdata) {
+    ConnState *conn = userdata;
+
+    // Binary mode switch: client sends the literal line "BINARY".
+    if (strcmp(line, "BINARY") == 0) {
+        conn->binary_mode = true;
+        protocol_set_binary(conn->fd);
+        // Send JSON ACK before switching — client reads this in JSON mode.
+        char *ack = protocol_ok(NULL, NULL);
+        // Force JSON send (binary_mode not registered yet for send path)
+        size_t len = strlen(ack);
+        write(conn->fd, ack, len);
+        write(conn->fd, "\n", 1);
+        free(ack);
+        RLS_INFO("client %d: switched to binary (MessagePack) mode", conn->id);
+        return;
+    }
+
+    ParsedCmd *p = protocol_parse_line(line);
+    if (!p) {
+        RLS_WARNING("client %d: parse error — %.200s", conn->id, line);
+        char *err = protocol_error(NULL, "parse error: invalid JSON or missing cmd");
+        protocol_send(conn->fd, err);
+        free(err);
+        return;
+    }
+
+    dispatch_cmd(conn, p);
+}
+
+// Decode a MessagePack payload and dispatch as a ParsedCmd.
+static void on_binary_message(ConnState *conn, const uint8_t *buf, size_t len) {
+    cJSON *root = mp_decode(buf, len);
+    if (!root) {
+        RLS_WARNING("client %d: msgpack decode error", conn->id);
+        char *err = protocol_error(NULL, "msgpack decode error");
+        protocol_send(conn->fd, err);
+        free(err);
+        return;
+    }
+
+    // Build ParsedCmd from decoded map (same fields as JSON protocol).
+    cJSON *cmd_item = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    if (!cJSON_IsString(cmd_item) || !cmd_item->valuestring) {
+        cJSON_Delete(root);
+        char *err = protocol_error(NULL, "missing cmd field");
+        protocol_send(conn->fd, err);
+        free(err);
+        return;
+    }
+
+    ParsedCmd *p = calloc(1, sizeof(ParsedCmd));
+    if (!p) { cJSON_Delete(root); return; }
+
+    p->cmd = strdup(cmd_item->valuestring);
+
+    cJSON *id_item = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (cJSON_IsString(id_item) && id_item->valuestring)
+        p->id = strdup(id_item->valuestring);
+
+    cJSON *args_item = cJSON_GetObjectItemCaseSensitive(root, "args");
+    if (args_item)
+        p->args = cJSON_DetachItemFromObject(root, "args");
+
+    cJSON_Delete(root);
+    dispatch_cmd(conn, p);
+}
+
+// recv() exactly n bytes into buf. Returns n on success, -1 on error/EOF.
+static ssize_t recv_all(int fd, void *buf, size_t n) {
+    size_t total = 0;
+    while (total < n) {
+        ssize_t r = recv(fd, (char *)buf + total, n - total, 0);
+        if (r <= 0) return -1;
+        total += (size_t)r;
+    }
+    return (ssize_t)n;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,22 +186,53 @@ static void *connection_thread(void *arg) {
     atomic_fetch_add(&g_active_clients, 1);
     RLS_INFO("client %d connected (fd=%d)", id, conn->fd);
 
-    while (1) {
+    // Phase 1: JSON / line-buffered mode.
+    while (!conn->binary_mode) {
         ssize_t n = recv(conn->fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) goto done;
 
         if (linebuf_feed(&conn->linebuf, buf, (size_t)n, on_line, conn) < 0) {
             RLS_WARNING("client %d: line too long, dropping connection", id);
             char *err = protocol_error(NULL, "line too long");
             protocol_send(conn->fd, err);
             free(err);
-            break;
+            goto done;
         }
     }
 
+    // Phase 2: binary (MessagePack) mode.
+    // Frame format: 4-byte little-endian uint32 length, then that many bytes.
+    {
+        uint8_t lenbuf[4];
+        while (recv_all(conn->fd, lenbuf, 4) == 4) {
+            uint32_t payload_len = (uint32_t)lenbuf[0]
+                                 | ((uint32_t)lenbuf[1] << 8)
+                                 | ((uint32_t)lenbuf[2] << 16)
+                                 | ((uint32_t)lenbuf[3] << 24);
+
+            if (payload_len == 0 || payload_len > (1u << 20)) {
+                RLS_WARNING("client %d: binary frame too large (%u)", id, payload_len);
+                break;
+            }
+
+            uint8_t *payload = malloc(payload_len);
+            if (!payload) break;
+
+            if (recv_all(conn->fd, payload, payload_len) != (ssize_t)payload_len) {
+                free(payload);
+                break;
+            }
+
+            on_binary_message(conn, payload, payload_len);
+            free(payload);
+        }
+    }
+
+done:
     atomic_fetch_sub(&g_active_clients, 1);
     if (conn->ev_registry)
         er_remove_fd(conn->ev_registry, conn->fd);
+    protocol_clear_binary(conn->fd);
     RLS_INFO("client %d disconnected", id);
     close(conn->fd);
     free(conn);
@@ -159,6 +268,7 @@ static void *listener_thread(void *arg) {
         conn->dl_registry = s->dl_registry;
         conn->ur_registry = s->ur_registry;
         conn->ev_registry = s->ev_registry;
+        conn->tr_registry = s->tr_registry;
         linebuf_init(&conn->linebuf);
 
         pthread_t t;
@@ -182,13 +292,15 @@ static void *listener_thread(void *arg) {
 void server_init(ServerState *s, int port, CmdQueue *queue,
                  DisplayListRegistry *dl_registry,
                  UploadRegistry      *ur_registry,
-                 EventRegistry       *ev_registry) {
+                 EventRegistry       *ev_registry,
+                 TimerRegistry       *tr_registry) {
     memset(s, 0, sizeof(*s));
     s->port        = port;
     s->queue       = queue;
     s->dl_registry = dl_registry;
     s->ur_registry = ur_registry;
     s->ev_registry = ev_registry;
+    s->tr_registry = tr_registry;
     s->listen_fd   = -1;
 }
 

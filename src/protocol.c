@@ -1,7 +1,9 @@
 #include "protocol.h"
+#include "msgpack.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // ---------------------------------------------------------------------------
 // ParsedCmd
@@ -86,8 +88,71 @@ char *protocol_error(const char *id, const char *msg) {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// Binary mode registry
+// ---------------------------------------------------------------------------
+
+#define BINARY_FD_MAX 256
+
+static int             g_binary_fds[BINARY_FD_MAX];
+static int             g_binary_count = 0;
+static pthread_mutex_t g_binary_lock  = PTHREAD_MUTEX_INITIALIZER;
+
+void protocol_set_binary(int fd) {
+    if (fd < 0) return;
+    pthread_mutex_lock(&g_binary_lock);
+    for (int i = 0; i < g_binary_count; i++) {
+        if (g_binary_fds[i] == fd) { pthread_mutex_unlock(&g_binary_lock); return; }
+    }
+    if (g_binary_count < BINARY_FD_MAX)
+        g_binary_fds[g_binary_count++] = fd;
+    pthread_mutex_unlock(&g_binary_lock);
+}
+
+void protocol_clear_binary(int fd) {
+    if (fd < 0) return;
+    pthread_mutex_lock(&g_binary_lock);
+    for (int i = 0; i < g_binary_count; i++) {
+        if (g_binary_fds[i] == fd) {
+            g_binary_fds[i] = g_binary_fds[--g_binary_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_binary_lock);
+}
+
+bool protocol_is_binary(int fd) {
+    if (fd < 0) return false;
+    pthread_mutex_lock(&g_binary_lock);
+    for (int i = 0; i < g_binary_count; i++) {
+        if (g_binary_fds[i] == fd) { pthread_mutex_unlock(&g_binary_lock); return true; }
+    }
+    pthread_mutex_unlock(&g_binary_lock);
+    return false;
+}
+
 bool protocol_send(int fd, const char *json) {
     if (fd < 0 || !json) return false;
+
+    if (protocol_is_binary(fd)) {
+        // Encode JSON string as MessagePack with 4-byte LE length prefix.
+        cJSON *val = cJSON_Parse(json);
+        if (!val) return false;
+        uint8_t *mp = NULL;
+        size_t   mp_len = 0;
+        if (!mp_encode(val, &mp, &mp_len)) { cJSON_Delete(val); return false; }
+        cJSON_Delete(val);
+        uint8_t hdr[4] = {
+            (uint8_t)(mp_len),
+            (uint8_t)(mp_len >> 8),
+            (uint8_t)(mp_len >> 16),
+            (uint8_t)(mp_len >> 24),
+        };
+        bool ok = (write(fd, hdr, 4) == 4) && (write(fd, mp, mp_len) == (ssize_t)mp_len);
+        free(mp);
+        return ok;
+    }
+
     size_t len = strlen(json);
     if (write(fd, json, len) != (ssize_t)len) return false;
     if (write(fd, "\n", 1) != 1) return false;
@@ -106,6 +171,19 @@ bool proto_parse_vec2(const cJSON *val, float *x, float *y) {
     if (!cJSON_IsNumber(xi) || !cJSON_IsNumber(yi)) return false;
     *x = (float)xi->valuedouble;
     *y = (float)yi->valuedouble;
+    return true;
+}
+
+bool proto_parse_vec3(const cJSON *val, float *x, float *y, float *z) {
+    if (!cJSON_IsArray(val)) return false;
+    if (cJSON_GetArraySize(val) != 3) return false;
+    const cJSON *xi = cJSON_GetArrayItem(val, 0);
+    const cJSON *yi = cJSON_GetArrayItem(val, 1);
+    const cJSON *zi = cJSON_GetArrayItem(val, 2);
+    if (!cJSON_IsNumber(xi) || !cJSON_IsNumber(yi) || !cJSON_IsNumber(zi)) return false;
+    *x = (float)xi->valuedouble;
+    *y = (float)yi->valuedouble;
+    *z = (float)zi->valuedouble;
     return true;
 }
 

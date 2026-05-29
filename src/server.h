@@ -3,6 +3,7 @@
 #include "display_list.h"
 #include "upload_registry.h"
 #include "event_registry.h"
+#include "timer_registry.h"
 #include <stdbool.h>
 #include <pthread.h>
 
@@ -12,6 +13,7 @@ typedef struct {
     DisplayListRegistry *dl_registry; /* may be NULL */
     UploadRegistry      *ur_registry; /* may be NULL */
     EventRegistry       *ev_registry; /* may be NULL */
+    TimerRegistry       *tr_registry; /* may be NULL */
 
     int              listen_fd;
     volatile bool    running;
@@ -22,7 +24,8 @@ typedef struct {
 void server_init(ServerState *s, int port, CmdQueue *queue,
                  DisplayListRegistry *dl_registry,
                  UploadRegistry      *ur_registry,
-                 EventRegistry       *ev_registry);
+                 EventRegistry       *ev_registry,
+                 TimerRegistry       *tr_registry);
 
 // Bind, listen, and start the listener thread.  Returns false on error.
 bool server_start(ServerState *s);

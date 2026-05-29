@@ -38,8 +38,24 @@ char *protocol_ok(const char *id, cJSON *result);
 char *protocol_error(const char *id, const char *msg);
 
 // Send a response over a socket fd.  Appends "\n".
+// If the fd has been registered as binary (see below), encodes the JSON as
+// MessagePack with a 4-byte little-endian length prefix instead.
 // Returns false on write error.
 bool protocol_send(int fd, const char *json);
+
+// ---------------------------------------------------------------------------
+// Binary mode (per-connection MessagePack framing)
+// ---------------------------------------------------------------------------
+
+// Register fd as using binary MessagePack framing.  Call from connection thread
+// after the client sends the "BINARY" switch line.
+void protocol_set_binary(int fd);
+
+// Deregister fd (call on disconnect).
+void protocol_clear_binary(int fd);
+
+// Returns true if fd is in binary mode.
+bool protocol_is_binary(int fd);
 
 // ---------------------------------------------------------------------------
 // JSON type parsers (no raylib dependency — usable from unit tests)
@@ -53,6 +69,11 @@ bool proto_parse_vec2(const cJSON *val, float *x, float *y);
 // Parse a four-element numeric JSON array [x, y, width, height] into floats.
 // Returns false on any structural or type mismatch.
 bool proto_parse_rect(const cJSON *val, float *x, float *y, float *w, float *h);
+
+// Parse a three-element numeric JSON array [x, y, z] into floats.
+// Returns false if val is NULL, not an array, not length 3, or contains
+// non-numeric elements.
+bool proto_parse_vec3(const cJSON *val, float *x, float *y, float *z);
 
 // ---------------------------------------------------------------------------
 // Line buffer — accumulates partial TCP reads and emits complete lines
