@@ -108,9 +108,9 @@ begin
       pulse_r = (200 * fast_pulse).round
       rls.draw_text(text: "Fast timer (0.2 s repeat) — #{fast_alive ? 'ACTIVE' : 'DELETED'}",
                     posX: 20, posY: 80, fontSize: 15, color: fast_alive ? 'SKYBLUE' : 'GRAY')
-      rls.draw_circle(posX: W / 2, posY: 150, radius: 40.0,
+      rls.draw_circle(centerX: W / 2, centerY: 150, radius: 40.0,
                       color: [pulse_r, 120, 255, 200])
-      rls.draw_circle_lines(posX: W / 2, posY: 150, radius: 40.0, color: 'SKYBLUE')
+      rls.draw_circle_lines(centerX: W / 2, centerY: 150, radius: 40.0, color: 'SKYBLUE')
       rls.draw_text(text: 'pulse', posX: W / 2 - 20, posY: 143, fontSize: 14, color: 'WHITE')
 
       # Slow timer bar
